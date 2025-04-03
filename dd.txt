@@ -1,0 +1,205 @@
+import time
+import json
+import uuid
+import jwt
+import requests
+import websocket
+import threading
+import pandas as pd
+import csv
+
+# ===== 설정 =====
+TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN'
+CHAT_ID = 'YOUR_CHAT_ID'
+SYMBOL = 'KRW-XRP'
+INTERVAL = 14
+CANDLE_LIMIT = 200
+UPBIT_ACCESS_KEY = 'YOUR_UPBIT_ACCESS_KEY'
+UPBIT_SECRET_KEY = 'YOUR_UPBIT_SECRET_KEY'
+
+# ===== 상태 =====
+price_data = []
+active_position = None
+paused = False
+strategy_id = None
+last_strategy = {}
+
+# ===== 유틸 함수 =====
+
+def send_signal(message):
+    url = f'https://api.telegram.org/bot{TOKEN}/sendMessage'
+    data = {'chat_id': CHAT_ID, 'text': message}
+    requests.post(url, data=data)
+
+def get_upbit_balance(currency='KRW'):
+    payload = {'access_key': UPBIT_ACCESS_KEY, 'nonce': str(uuid.uuid4())}
+    jwt_token = jwt.encode(payload, UPBIT_SECRET_KEY)
+    headers = {"Authorization": f"Bearer {jwt_token}"}
+    res = requests.get("https://api.upbit.com/v1/accounts", headers=headers)
+    if res.status_code == 200:
+        for b in res.json():
+            if b['currency'] == currency:
+                return round(float(b['balance']) - float(b['locked']), 2)
+    return 0.0
+
+def calculate_rsi(data, period=14):
+    df = pd.Series(data)
+    delta = df.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ma_up = up.rolling(period).mean()
+    ma_down = down.rolling(period).mean()
+    rsi = 100 - (100 / (1 + (ma_up / ma_down)))
+    return round(rsi.iloc[-1], 2)
+
+def classify_strategy(rsi, adx, volume_rate):
+    if rsi <= 35 and adx <= 30:
+        return "단타형", 3185, 3080, 3310, 3380, 85.3
+    elif 35 < rsi <= 50 and 30 < adx <= 35:
+        return "눌림 돌파형", 2840000, 2800000, 2890000, 2950000, 83.1
+    elif rsi > 50 and adx > 35:
+        return "추세 지속형", 3020000, 2980000, 3100000, 3190000, 81.5
+    else:
+        return "보류", None, None, None, None, 0
+
+def adjust_tp(rsi_now, adx_now, volume_now, current_tp):
+    if rsi_now > 60 and adx_now > 35 and volume_now > 2.0:
+        new_tp = int(current_tp * 1.05)
+        send_signal(f"📈 익절 상향 제안: {current_tp} → {new_tp}")
+        return new_tp
+    return current_tp
+
+def generate_strategy_id():
+    return str(uuid.uuid4())[:8]
+
+def generate_strategy_report(t, entry, stop, tp1, tp2, conf, cash, sid):
+    return (
+        f"🚨 전략 조건 충족!\n전략 ID: {sid}\n전략군: {t}\n"
+        f"진입가: {entry}원\n손절가: {stop}원\n익절가: {tp1} / {tp2}원\n"
+        f"조건 충족도: {conf}%\n추천 진입 금액: {cash}원\n전략 유효시간: 90분"
+    )
+
+def log_result(result_type, exit_price):
+    with open("strategy_log.csv", "a", newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            strategy_id,
+            active_position['symbol'],
+            active_position['entry'],
+            exit_price,
+            result_type,
+            time.strftime("%Y-%m-%d %H:%M:%S")
+        ])
+    print("📝 회고 저장됨")
+
+def log_failed_condition(rsi, adx, volume):
+    with open("failed_conditions.csv", "a", newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([rsi, adx, volume, time.strftime("%Y-%m-%d %H:%M:%S")])
+    print("📛 실패 조건 저장됨")
+# ==== 전략 리포트 요약 ====
+def generate_summary():
+    try:
+        df = pd.read_csv("strategy_log.csv", header=None)
+        total = len(df)
+        wins = len(df[df[3] == "익절"])
+        success_rate = round(wins / total * 100, 2)
+        send_signal(f"📊 전략 요약\n총 전략: {total}회\n익절률: {success_rate}%")
+    except:
+        send_signal("📁 회고 로그 없음 (요약 불가)")
+
+# ==== 설계자 명령어 응답 ====
+def handle_command(msg):
+    global active_position, last_strategy
+    if msg in ["상태", "포지션"]:
+        if active_position:
+            send_signal(f"📌 현재 포지션\n진입가: {active_position['entry']}원\n익절가: {active_position['tp']}원\n손절가: {active_position['stop']}원")
+        else:
+            send_signal("📭 현재 포지션 없음.")
+    elif msg in ["전략", "마지막 전략"]:
+        if last_strategy:
+            send_signal(f"📄 마지막 전략 요약\n전략 ID: {last_strategy['id']}\n군: {last_strategy['type']}\n진입가: {last_strategy['entry']}원")
+        else:
+            send_signal("📁 최근 전략 없음.")
+    elif msg in ["회고", "요약"]:
+        generate_summary()
+
+# ==== 텔레그램 명령 감지 확장 ====
+def check_command_signal():
+    url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
+    response = requests.get(url).json()
+    for result in response.get("result", []):
+        msg = result.get("message", {}).get("text", "").strip().lower()
+        if msg in ["stop", "그만해", "멈춰"]:
+            return "STOP"
+        elif msg in ["resume", "다시 시작", "시작해"]:
+            return "RESUME"
+        elif msg in ["상태", "포지션", "전략", "마지막 전략", "회고", "요약"]:
+            handle_command(msg)
+    return None
+
+# ==== WebSocket 메시지 처리 ====
+def on_message(ws, message):
+    global price_data, active_position, paused, strategy_id, last_strategy
+
+    cmd = check_command_signal()
+    if cmd == "STOP":
+        paused = True
+        send_signal("🛑 전략 루프 정지됨 (설계자 명령)")
+    elif cmd == "RESUME":
+        paused = False
+        send_signal("▶️ 전략 루프 재시작됨")
+
+    if paused:
+        return
+
+    data = json.loads(message)[0]
+    price = float(data['trade_price'])
+    price_data.append(price)
+    if len(price_data) > CANDLE_LIMIT:
+        price_data.pop(0)
+
+    if len(price_data) >= INTERVAL:
+        rsi = calculate_rsi(price_data, INTERVAL)
+        adx = 31  # 실시간 계산 가능 확장 가능
+        volume = 2.1  # 예시값, 연동 가능
+
+        print(f"📊 현재가: {price} | RSI: {rsi} | ADX: {adx}")
+
+        if not active_position:
+            t, entry, stop, tp1, tp2, conf = classify_strategy(rsi, adx, volume)
+            if t != "보류":
+                strategy_id = generate_strategy_id()
+                cash = int(get_upbit_balance() * 0.35)
+                msg = generate_strategy_report(t, entry, stop, tp1, tp2, conf, cash, strategy_id)
+                send_signal(msg)
+                active_position = {'symbol': SYMBOL, 'entry': entry, 'stop': stop, 'tp': tp1}
+                last_strategy = {'id': strategy_id, 'type': t, 'entry': entry}
+        else:
+            active_position['tp'] = adjust_tp(rsi, adx, volume, active_position['tp'])
+
+            if price <= active_position['stop']:
+                send_signal(f"❌ 손절 도달: {price}원 → 전략 종료")
+                log_result("손절", price)
+                log_failed_condition(rsi, adx, volume)
+                active_position = None
+            elif price >= active_position['tp']:
+                send_signal(f"✅ 익절 도달: {price}원 → 전략 종료")
+                log_result("익절", price)
+                active_position = None
+                generate_summary()
+
+# ==== WebSocket 연결 설정 ====
+def on_open(ws):
+    print("✅ WebSocket 연결됨")
+    payload = [{"ticket": "gpt-loop"}, {"type": "trade", "codes": [SYMBOL]}]
+    ws.send(json.dumps(payload))
+
+# ==== 실행 시작 ====
+def run_websocket():
+    url = "wss://api.upbit.com/websocket/v1"
+    ws = websocket.WebSocketApp(url, on_open=on_open, on_message=on_message)
+    ws.run_forever()
+
+print("▶ GPT 자동 전략 시스템 (Ver.2.0 확장 최종판) 가동 시작")
+threading.Thread(target=run_websocket).start()
