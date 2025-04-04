@@ -1,73 +1,92 @@
-import os
-import pyupbit
 from telegram.ext import Updater, CommandHandler
+import os, pyupbit, pandas as pd
 
-# 환경변수에서 키값 설정
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-UPBIT_ACCESS_KEY = os.environ.get("UPBIT_ACCESS_KEY")
-UPBIT_SECRET_KEY = os.environ.get("UPBIT_SECRET_KEY")
+upbit = pyupbit.Upbit(os.environ["UPBIT_ACCESS_KEY"], os.environ["UPBIT_SECRET_KEY"])
 
-# API 연결
-upbit = pyupbit.Upbit(UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY)
+open_positions = {}
 
-# 텔레그램 명령어: 잔고확인
 def balance(update, context):
-    try:
-        krw_balance = upbit.get_balance("KRW")
-        if krw_balance is not None:
-            msg = f"KRW 자산: {krw_balance:,.0f}원"
-        else:
-            msg = "잔고 조회 실패"
-    except Exception as e:
-        msg = f"잔고 조회 중 오류 발생: {e}"
+    krw_balance = upbit.get_balance("KRW")
+    update.message.reply_text(f"KRW balance: {krw_balance:,.0f} KRW")
+
+def status(update, context):
+    if open_positions:
+        msg = "\n".join([f"{t}: entry {d['entry_price']} → now {pyupbit.get_current_price(t)} (TP:{d['tp']}%, SL:{d['sl']}%)"
+                         for t, d in open_positions.items()])
+    else:
+        msg = "No positions."
     update.message.reply_text(msg)
 
-# 텔레그램 명령어: 특정 종목 현재가 확인
 def price(update, context):
     try:
         ticker = context.args[0].upper()
         current_price = pyupbit.get_current_price(ticker)
-        if current_price:
-            msg = f"{ticker} 현재가: {current_price:,.0f}원"
-        else:
-            msg = f"{ticker} 종목을 찾을 수 없습니다."
+        update.message.reply_text(f"{ticker} current price: {current_price} KRW")
     except IndexError:
-        msg = "사용법: /price [종목명] (예시: /price KRW-BTC)"
+        update.message.reply_text("Usage: /price [TICKER] (ex: /price BTC)")
     except Exception as e:
-        msg = f"가격 조회 중 오류 발생: {e}"
-    update.message.reply_text(msg)
+        update.message.reply_text(f"Error: {e}")
 
-# 텔레그램 명령어: 포지션 상태 확인 (임시 더미데이터)
-open_positions = {}  # 실제 운용 중인 포지션 데이터를 여기서 불러와야 함
-def status(update, context):
+def buy(update, context):
     try:
-        if open_positions:
-            msg = "\n".join(
-                f"{t}: 진입가 {d['entry_price']}원, TP:{d['tp']}%, SL:{d['sl']}%"
-                for t, d in open_positions.items()
-            )
-        else:
-            msg = "현재 보유중인 포지션이 없습니다."
+        ticker, amount = context.args[0].upper(), float(context.args[1])
+        result = upbit.buy_market_order(ticker, amount)
+        update.message.reply_text(f"Buy order placed: {result}")
+    except IndexError:
+        update.message.reply_text("Usage: /buy [TICKER] [AMOUNT] (ex: /buy BTC 5000)")
     except Exception as e:
-        msg = f"포지션 상태 조회 중 오류: {e}"
-    update.message.reply_text(msg)
+        update.message.reply_text(f"Error: {e}")
 
-# 텔레그램 명령어: 코드 검증 요청 메시지
-def codecheck(update, context):
-    update.message.reply_text("전체 코드 검증 요청을 완료했습니다.")
+def sell(update, context):
+    try:
+        ticker, amount = context.args[0].upper(), float(context.args[1])
+        result = upbit.sell_market_order(ticker, amount)
+        update.message.reply_text(f"Sell order placed: {result}")
+    except IndexError:
+        update.message.reply_text("Usage: /sell [TICKER] [AMOUNT] (ex: /sell BTC 0.01)")
+    except Exception as e:
+        update.message.reply_text(f"Error: {e}")
 
-# 명령어 등록 및 텔레그램 봇 가동
-def run_telegram_bot():
-    updater = Updater(token=TELEGRAM_BOT_TOKEN)
+def positions(update, context):
+    if open_positions:
+        details = "\n".join([f"{t}: {data}" for t, data in open_positions.items()])
+        update.message.reply_text(f"Open positions:\n{details}")
+    else:
+        update.message.reply_text("No open positions.")
+
+def logs(update, context):
+    filename = f"trade_results_{pd.Timestamp.now().strftime('%Y-%m')}.csv"
+    if os.path.exists(filename):
+        df = pd.read_csv(filename)
+        recent_logs = df.tail(5).to_string(index=False)
+        update.message.reply_text(f"Recent trades:\n{recent_logs}")
+    else:
+        update.message.reply_text("No recent logs.")
+
+def stop(update, context):
+    try:
+        ticker = context.args[0].upper()
+        open_positions.pop(ticker, None)
+        update.message.reply_text(f"Stopped automated trading for {ticker}.")
+    except IndexError:
+        update.message.reply_text("Usage: /stop [TICKER] (ex: /stop BTC)")
+    except Exception as e:
+        update.message.reply_text(f"Error: {e}")
+
+def telegram_bot_commands():
+    updater = Updater(token=os.environ["TELEGRAM_BOT_TOKEN"])
     dispatcher = updater.dispatcher
 
     dispatcher.add_handler(CommandHandler('balance', balance))
-    dispatcher.add_handler(CommandHandler('price', price))
     dispatcher.add_handler(CommandHandler('status', status))
-    dispatcher.add_handler(CommandHandler('codecheck', codecheck))
+    dispatcher.add_handler(CommandHandler('price', price))
+    dispatcher.add_handler(CommandHandler('buy', buy))
+    dispatcher.add_handler(CommandHandler('sell', sell))
+    dispatcher.add_handler(CommandHandler('positions', positions))
+    dispatcher.add_handler(CommandHandler('logs', logs))
+    dispatcher.add_handler(CommandHandler('stop', stop))
 
     updater.start_polling()
-    print("텔레그램 봇이 실행중입니다.")
+    updater.idle()
 
-if __name__ == "__main__":
-    run_telegram_bot()
+telegram_bot_commands()
