@@ -78,12 +78,12 @@ def prune_strategies():
         print(f"[전략 제거 실패] {e}")
 
 def gpt_entry_evaluation(ticker, strategy, price):
-    prompt = f"""
+    prompt = f'''
     당신은 정확한 암호화폐 전략 판단가입니다.
     종목: {ticker}, 전략: {strategy}, 현재가: {price}원
     성공확률, 익절가, 손절가, 추천 비중을 아래 형식으로 제시하세요.
     형식: 성공확률:[%] 익절가:[%] 손절가:[%] 비중:[%]
-    """
+    '''
     try:
         response = openai.ChatCompletion.create(
             model="gpt-4-turbo",
@@ -147,3 +147,34 @@ def execute_buy(ticker, strategy):
     else:
         send_telegram_message(f"[매수실패] {ticker}: {result}")
         return False
+
+# ✅ 전략 실행: 익절/손절/트레일링 스탑
+def check_exit_conditions():
+    for ticker, info in list(open_positions.items()):
+        current_price = pyupbit.get_current_price(ticker)
+        entry = info["entry_price"]
+        tp_price = entry * (1 + info["tp"] / 100)
+        sl_price = entry * (1 - info["sl"] / 100)
+
+        if current_price > info["high_price"]:
+            info["high_price"] = current_price
+
+        trail_sl_price = info["high_price"] * (1 - TRAILING_STOP_GAP / 100)
+
+        if current_price >= tp_price:
+            upbit.sell_market_order(ticker, upbit.get_balance(ticker))
+            send_telegram_message(f"[익절매도] {ticker} / 현재가:{current_price}")
+            log_trade(ticker, entry, current_price, info["strategy"], "익절")
+            del open_positions[ticker]
+        elif current_price <= sl_price or current_price <= trail_sl_price:
+            upbit.sell_market_order(ticker, upbit.get_balance(ticker))
+            send_telegram_message(f"[손절매도] {ticker} / 현재가:{current_price}")
+            log_trade(ticker, entry, current_price, info["strategy"], "손절")
+            del open_positions[ticker]
+
+# ✅ 실행 루프
+def run():
+    schedule.every(10).seconds.do(check_exit_conditions)
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
