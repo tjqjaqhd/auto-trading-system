@@ -1,9 +1,9 @@
 import pyupbit
 import openai
 import pandas as pd
-import time, datetime, os, threading, re, asyncio, schedule
-from telegram import Bot
-from telegram.ext import Application, CommandHandler
+import time, datetime, os, threading, re, schedule
+from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # 환경 변수 확인
 required_envs = [
@@ -46,44 +46,13 @@ def send_telegram_message(text):
     except Exception as e:
         print(f"[텔레그램 전송 실패] {e}")
 
-# ✅ GPT 전략 제안 (텔레그램 명령)
-async def 전략생성(update, context):
-    try:
-        text = "📊 전략 성과:\n"
-        stats = pd.read_csv("strategy_stats.csv")
-        for _, row in stats.iterrows():
-            text += f"- {row['전략']}: 익절 {row['익절']} / 손절 {row['손절']}\n"
-
-        prompt = text + "위 통계 외에 현재 장세에서 유망한 전략 2개를 제안해줘. 조건도 간단히 설명해줘."
-        response = openai.ChatCompletion.create(
-            model="gpt-4-turbo",
-            messages=[
-                {"role": "system", "content": "전략 설계 전문가"},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        idea = response.choices[0].message.content
-        await update.message.reply_text(f"[GPT 전략제안]\n{idea}")
-    except Exception as e:
-        await update.message.reply_text(f"[전략 생성 오류] {e}")
-
-# ✅ 수익률 낮은 전략 자동 제거
-def prune_strategies():
-    try:
-        df = pd.read_csv("trade_results_2025-04.csv")
-        result = df.groupby("전략")["현재가"].agg(["count", "mean"])
-        losers = result[result["mean"] < 0].index.tolist()
-        blocked_strategies.update(losers)
-    except Exception as e:
-        print(f"[전략 제거 실패] {e}")
-
 def gpt_entry_evaluation(ticker, strategy, price):
-    prompt = f'''
+    prompt = f"""
     당신은 정확한 암호화폐 전략 판단가입니다.
     종목: {ticker}, 전략: {strategy}, 현재가: {price}원
     성공확률, 익절가, 손절가, 추천 비중을 아래 형식으로 제시하세요.
     형식: 성공확률:[%] 익절가:[%] 손절가:[%] 비중:[%]
-    '''
+    """
     try:
         response = openai.ChatCompletion.create(
             model="gpt-4-turbo",
@@ -102,7 +71,6 @@ def gpt_entry_evaluation(ticker, strategy, price):
         send_telegram_message(f"[GPT 호출 실패] {e}")
     return 0, 0, 0, 0
 
-# ✅ 전략 실행: 진입 판단 및 매수
 def execute_buy(ticker, strategy):
     current_price = pyupbit.get_current_price(ticker)
     prob, tp, sl, ratio = gpt_entry_evaluation(ticker, strategy, current_price)
@@ -140,15 +108,12 @@ def execute_buy(ticker, strategy):
             "gpt_count": 0,
             "high_price": current_price
         }
-        send_telegram_message(
-            f"[매수완료] {ticker} 비중:{ratio}% TP:{tp}% SL:{sl}%"
-        )
+        send_telegram_message(f"[매수완료] {ticker} 비중:{ratio}% TP:{tp}% SL:{sl}%")
         return True
     else:
         send_telegram_message(f"[매수실패] {ticker}: {result}")
         return False
 
-# ✅ 전략 실행: 익절/손절/트레일링 스탑
 def check_exit_conditions():
     for ticker, info in list(open_positions.items()):
         current_price = pyupbit.get_current_price(ticker)
@@ -172,9 +137,88 @@ def check_exit_conditions():
             log_trade(ticker, entry, current_price, info["strategy"], "손절")
             del open_positions[ticker]
 
-# ✅ 실행 루프
-def run():
+def generate_daily_report():
+    try:
+        today = datetime.datetime.now().strftime("%Y-%m")
+        filename = f"trade_results_{today}.csv"
+        if not os.path.exists(filename):
+            send_telegram_message("[리포트 없음] 오늘 거래 기록이 없습니다.")
+            return
+
+        df = pd.read_csv(filename)
+        today_df = df[df['시간'].str.startswith(datetime.datetime.now().strftime('%Y-%m-%d'))]
+        summary = today_df.groupby("전략")["현재가"].agg(['count', 'mean'])
+
+        prompt = f"""
+        다음은 오늘 암호화폐 매매 전략별 성과 요약입니다:
+        {summary.to_string()}
+        다음을 포함한 일일 리포트를 작성하세요:
+        - 오늘 요약
+        - 문제점
+        - 내일 전략 방향성
+        - 매매 종료 종목을 30분간 더 추적했다면 전략 타당성은 어땠을지 평가
+        - 전반적인 전략의 정확도 평가
+        """
+        response = openai.ChatCompletion.create(
+            model="gpt-4-turbo",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        result = response.choices[0].message.content.strip()
+        send_telegram_message("[📊 GPT 일일 리포트]\n" + result)
+    except Exception as e:
+        send_telegram_message(f"[리포트 생성 오류] {e}")
+
+def run_all():
     schedule.every(10).seconds.do(check_exit_conditions)
+    schedule.every().day.at("23:00").do(generate_daily_report)
     while True:
         schedule.run_pending()
         time.sleep(1)
+
+# 텔레그램 명령
+async def 시작(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    threading.Thread(target=run_all).start()
+    await update.message.reply_text("✅ 자동매매 루프 시작됨")
+
+async def 전략생성(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        text = "📊 전략 성과:\n"
+        stats = pd.read_csv("strategy_stats.csv")
+        for _, row in stats.iterrows():
+            text += f"- {row['전략']}: 익절 {row['익절']} / 손절 {row['손절']}\n"
+        prompt = text + "위 통계 외에 현재 장세에서 유망한 전략 2개를 제안해줘. 조건도 간단히 설명해줘."
+        response = openai.ChatCompletion.create(
+            model="gpt-4-turbo",
+            messages=[
+                {"role": "system", "content": "전략 설계 전문가"},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        idea = response.choices[0].message.content
+        await update.message.reply_text(f"[GPT 전략제안]\n{idea}")
+    except Exception as e:
+        await update.message.reply_text(f"[전략 생성 오류] {e}")
+
+async def 잔고(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    balance = upbit.get_balance("KRW")
+    await update.message.reply_text(f"💰 현재 잔고: {balance:,.0f} KRW")
+
+async def 수동매수(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text("형식: /매수 티커 전략명")
+        return
+    ticker, strategy = context.args[0], context.args[1]
+    result = execute_buy(ticker, strategy)
+    await update.message.reply_text(f"🛒 매수 결과: {result}")
+
+def main():
+    application = Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
+    application.add_handler(CommandHandler("시작", 시작))
+    application.add_handler(CommandHandler("전략생성", 전략생성))
+    application.add_handler(CommandHandler("잔고", 잔고))
+    application.add_handler(CommandHandler("매수", 수동매수))
+    application.run_polling()
+
+if __name__ == "__main__":
+    threading.Thread(target=run_all).start()
+    main()
